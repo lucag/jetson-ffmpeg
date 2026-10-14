@@ -364,7 +364,7 @@ new file mode 100644
 index 0000000..0e1390e
 --- /dev/null
 +++ b/libavcodec/nvmpi_enc.c
-@@ -0,0 +1,272 @@
+@@ -0,0 +1,282 @@
 +#include <nvmpi.h>
 +#include "avcodec.h"
 +#include "internal.h"
@@ -454,6 +454,9 @@ index 0000000..0e1390e
 +			_nvframe.payload_size[0]=linesize[0]*avctx->height;
 +			_nvframe.payload_size[1]=linesize[1]*avctx->height/2;
 +			_nvframe.payload_size[2]=linesize[2]*avctx->height/2;
++			_nvframe.linesize[0]=linesize[0];
++			_nvframe.linesize[1]=linesize[1];
++			_nvframe.linesize[2]=linesize[2];
 +
 +			nvmpi_encoder_put_frame(_ctx,&_nvframe);
 +
@@ -517,6 +520,13 @@ index 0000000..0e1390e
 +		_nvframe.timestamp=frame->pts;
 +
 +		res=nvmpi_encoder_put_frame(nvmpi_context->ctx,&_nvframe);
++
++		if(res<0)
++			return res;
++	}else{
++		// Flushing: signal end of stream (once), so that get_packet drains the
++		// encoder instead of leaving its last frames behind.
++		res=nvmpi_encoder_put_frame(nvmpi_context->ctx,NULL);
 +
 +		if(res<0)
 +			return res;

@@ -6,9 +6,15 @@
 #include <thread>
 #include <unistd.h>
 #include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <chrono>
+#include <algorithm>
 
 #define CHUNK_SIZE 2*1024*1024
 #define MAX_BUFFERS 32
+// How long get_packet waits for each packet while draining after end of stream.
+#define DRAIN_TIMEOUT_MS 10000
 #define TEST_ERROR(condition, message, errorCode)    \
 	if (condition)                               \
 {                                                    \
@@ -51,7 +57,19 @@ struct nvmpictx{
 	bool packets_keyflag[MAX_BUFFERS];
 	uint64_t timestamp[MAX_BUFFERS];
 	int buf_index;
+
+	// The capture thread fills the packet pool; get_packet empties it.
+	std::mutex * lock;
+	std::condition_variable * packet_ready;
+	bool eos_sent;      // put_frame(NULL) queued the end-of-stream buffer
+	bool eos_received;  // the encoder's end of stream came out, or the capture thread stopped
 };
+
+static void mark_drained(nvmpictx *ctx){
+	std::lock_guard<std::mutex> guard(*ctx->lock);
+	ctx->eos_received=true;
+	ctx->packet_ready->notify_all();
+}
 
 
 static bool encoder_capture_plane_dq_callback(struct v4l2_buffer *v4l2_buf, NvBuffer * buffer, NvBuffer * shared_buffer, void *arg){
@@ -63,14 +81,18 @@ static bool encoder_capture_plane_dq_callback(struct v4l2_buffer *v4l2_buf, NvBu
 	if (v4l2_buf == NULL)
 	{
 		cout << "Error while dequeing buffer from output plane" << endl;
+		mark_drained(ctx);
 		return false;
 	}
 
+	// An empty buffer is the encoder's end of stream: every frame is out.
 	if (buffer->planes[0].bytesused == 0)
 	{
-		cout << "Got 0 size buffer in capture \n";
+		mark_drained(ctx);
 		return false;
 	}
+
+	std::unique_lock<std::mutex> guard(*ctx->lock);
 
 	if(ctx->packets_buf_size < buffer->planes[0].bytesused){
 
@@ -98,6 +120,8 @@ static bool encoder_capture_plane_dq_callback(struct v4l2_buffer *v4l2_buf, NvBu
 	}
 
 	ctx->buf_index=(ctx->buf_index+1)%ctx->packets_num;	
+	ctx->packet_ready->notify_all();
+	guard.unlock();
 
 	if (ctx->enc->capture_plane.qBuffer(*v4l2_buf, NULL) < 0)
 	{
@@ -126,6 +150,10 @@ nvmpictx* nvmpi_create_encoder(nvCodingType codingType,nvEncParam * param){
 	ctx->fps_d = param->fps_d;
 	ctx->iframe_interval = param->iframe_interval;
 	ctx->packet_pools=new std::queue<int>;
+	ctx->lock=new std::mutex;
+	ctx->packet_ready=new std::condition_variable;
+	ctx->eos_sent=false;
+	ctx->eos_received=false;
 	ctx->buf_index=0;
 	ctx->enable_extended_colorformat=false;
 	ctx->packets_num=param->capture_num;
@@ -374,6 +402,25 @@ nvmpictx* nvmpi_create_encoder(nvCodingType codingType,nvEncParam * param){
 }
 
 
+// Copy a plane row by row: the frame's rows may be padded (its linesize),
+// while the encoder's buffer has its own stride.
+static void copy_plane(NvBuffer::NvBufferPlane *plane, const unsigned char *src,
+		unsigned int src_stride, unsigned long src_size){
+
+	uint32_t row_bytes=plane->fmt.width*plane->fmt.bytesperpixel;
+	uint32_t rows=plane->fmt.height;
+
+	if(src_stride==0) // no linesize given: rows are as long as the plane is wide
+		src_stride=row_bytes;
+	if(src_size && src_size/src_stride < rows) // never read past the frame
+		rows=src_size/src_stride;
+
+	for(uint32_t y=0;y<rows;y++)
+		memcpy(plane->data+y*plane->fmt.stride,src+y*src_stride,std::min(row_bytes,src_stride));
+
+	plane->bytesused=plane->fmt.stride*plane->fmt.height;
+}
+
 int nvmpi_encoder_put_frame(nvmpictx* ctx,nvFrame* frame){
 	int ret;
 
@@ -389,6 +436,9 @@ int nvmpi_encoder_put_frame(nvmpictx* ctx,nvFrame* frame){
 	if(ctx->enc->isInError())
 		return -1;
 
+	if(frame==NULL && ctx->eos_sent)
+		return 0;
+
 	if(ctx->index < ctx->enc->output_plane.getNumBuffers()){
 
 		nvBuffer=ctx->enc->output_plane.getNthBuffer(ctx->index);
@@ -399,17 +449,32 @@ int nvmpi_encoder_put_frame(nvmpictx* ctx,nvFrame* frame){
 		ret = ctx->enc->output_plane.dqBuffer(v4l2_buf, &nvBuffer, NULL, -1);
 		if (ret < 0) {
 			cout << "Error DQing buffer at output plane" << std::endl;
-			return false;
+			return -1;
 		}
 
 	}
 
-	memcpy(nvBuffer->planes[0].data,frame->payload[0],frame->payload_size[0]);
-	memcpy(nvBuffer->planes[1].data,frame->payload[1],frame->payload_size[1]);
-	memcpy(nvBuffer->planes[2].data,frame->payload[2],frame->payload_size[2]);
-	nvBuffer->planes[0].bytesused=frame->payload_size[0];
-	nvBuffer->planes[1].bytesused=frame->payload_size[1];
-	nvBuffer->planes[2].bytesused=frame->payload_size[2];
+	if(frame==NULL){
+		// End of stream: an empty buffer. The encoder answers, once every
+		// frame queued before it is encoded, with an empty capture buffer.
+		for(uint32_t i=0;i<nvBuffer->n_planes;i++)
+			nvBuffer->planes[i].bytesused=0;
+
+		{
+			std::lock_guard<std::mutex> guard(*ctx->lock);
+			ctx->eos_sent=true;
+		}
+		ret = ctx->enc->output_plane.qBuffer(v4l2_buf, NULL);
+		if(ret < 0){
+			cout << "Error while queueing end of stream at output plane" << std::endl;
+			mark_drained(ctx);
+			return -1;
+		}
+		return 0;
+	}
+
+	for(uint32_t i=0;i<3 && i<nvBuffer->n_planes;i++)
+		copy_plane(&nvBuffer->planes[i],frame->payload[i],frame->linesize[i],frame->payload_size[i]);
 
 	v4l2_buf.flags |= V4L2_BUF_FLAG_TIMESTAMP_COPY;
 	v4l2_buf.timestamp.tv_usec = frame->timestamp % 1000000;
@@ -421,9 +486,20 @@ int nvmpi_encoder_put_frame(nvmpictx* ctx,nvFrame* frame){
 	return 0;
 }
 
+// Take the next encoded packet. Before end of stream it doesn't wait: -1 means
+// none is ready yet. After put_frame(NULL) it waits for each packet, and -1
+// means the encoder is drained.
 int nvmpi_encoder_get_packet(nvmpictx* ctx,nvPacket* packet){
 
-	int ret,packet_index;
+	int packet_index;
+	std::unique_lock<std::mutex> guard(*ctx->lock);
+
+	if(ctx->eos_sent){
+		bool ready=ctx->packet_ready->wait_for(guard,std::chrono::milliseconds(DRAIN_TIMEOUT_MS),
+				[ctx]{return !ctx->packet_pools->empty() || ctx->eos_received;});
+		if(!ready)
+			cout << "Timed out draining the encoder" << std::endl;
+	}
 
 	if(ctx->packet_pools->empty())
 		return -1;
@@ -454,6 +530,9 @@ int nvmpi_encoder_close(nvmpictx* ctx){
 	ctx->enc->capture_plane.waitForDQThread(1000);
 	delete ctx->enc;
 	delete ctx->packet_pools;
+	delete ctx->packet_ready;
+	delete ctx->lock;
 	delete ctx;
+	return 0;
 }
 
