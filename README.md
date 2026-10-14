@@ -10,7 +10,7 @@ This fork of [jocover/jetson-ffmpeg](https://github.com/jocover/jetson-ffmpeg) f
 
 **1.build and install library**
 
-    git clone https://github.com/lucag/jetson-ffmpeg.git
+    git clone -b fix-stride-and-flush https://github.com/lucag/jetson-ffmpeg.git
     cd jetson-ffmpeg
     mkdir build
     cd build
