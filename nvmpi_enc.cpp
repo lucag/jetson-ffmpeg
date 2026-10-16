@@ -10,9 +10,9 @@
 #include <condition_variable>
 #include <chrono>
 #include <algorithm>
+#include <memory>
 
 #define CHUNK_SIZE 2*1024*1024
-#define MAX_BUFFERS 32
 // How long get_packet waits for each packet while draining after end of stream.
 #define DRAIN_TIMEOUT_MS 10000
 #define TEST_ERROR(condition, message, errorCode)    \
@@ -24,10 +24,15 @@
 
 using namespace std;
 
+struct nvEncodedPacket{
+	std::vector<unsigned char> data;
+	uint64_t pts;
+	bool key;
+};
+
 struct nvmpictx{
 	NvVideoEncoder *enc;
 	int index;
-	std::queue<int> * packet_pools;
 	uint32_t width;
 	uint32_t height;
 	uint32_t profile;
@@ -50,15 +55,14 @@ struct nvmpictx{
 	uint32_t num_reference_frames;
 	bool insert_sps_pps_at_idr;
 
-	uint32_t packets_buf_size;
-	uint32_t packets_num;
-	unsigned char * packets[MAX_BUFFERS];
-	uint32_t packets_size[MAX_BUFFERS];
-	bool packets_keyflag[MAX_BUFFERS];
-	uint64_t timestamp[MAX_BUFFERS];
-	int buf_index;
+	uint32_t packets_num;  // buffers in each plane
 
-	// The capture thread fills the packet pool; get_packet empties it.
+	// The capture thread queues a copy of each encoded packet; get_packet
+	// takes them in order. The queue has no bound: ffmpeg takes at most one
+	// packet per frame it puts, so packets pile up whenever the encoder's
+	// latency grows, and none may be dropped.
+	std::queue<std::unique_ptr<nvEncodedPacket>> * packets;
+	std::unique_ptr<nvEncodedPacket> * taken;  // the last packet get_packet returned
 	std::mutex * lock;
 	std::condition_variable * packet_ready;
 	bool eos_sent;      // put_frame(NULL) queued the end-of-stream buffer
@@ -92,36 +96,19 @@ static bool encoder_capture_plane_dq_callback(struct v4l2_buffer *v4l2_buf, NvBu
 		return false;
 	}
 
-	std::unique_lock<std::mutex> guard(*ctx->lock);
-
-	if(ctx->packets_buf_size < buffer->planes[0].bytesused){
-
-		ctx->packets_buf_size=buffer->planes[0].bytesused;
-
-		for(int index=0;index< ctx->packets_num;index++){
-			delete[] ctx->packets[index];
-			ctx->packets[index]=new unsigned char[ctx->packets_buf_size];	
-		}
-	}
-
-	ctx->packets_size[ctx->buf_index]=buffer->planes[0].bytesused;
-	memcpy(ctx->packets[ctx->buf_index],buffer->planes[0].data,buffer->planes[0].bytesused);
-
-	ctx->timestamp[ctx->buf_index] = (v4l2_buf->timestamp.tv_usec % 1000000) + (v4l2_buf->timestamp.tv_sec * 1000000UL);
-
-	ctx->packet_pools->push(ctx->buf_index);
+	std::unique_ptr<nvEncodedPacket> packet(new nvEncodedPacket);
+	packet->data.assign(buffer->planes[0].data,buffer->planes[0].data+buffer->planes[0].bytesused);
+	packet->pts=(v4l2_buf->timestamp.tv_usec % 1000000) + (v4l2_buf->timestamp.tv_sec * 1000000UL);
 
 	v4l2_ctrl_videoenc_outputbuf_metadata enc_metadata;
 	ctx->enc->getMetadata(v4l2_buf->index, enc_metadata);
-	if(enc_metadata.KeyFrame){
-		ctx->packets_keyflag[ctx->buf_index]=true;
-	}else{
-		ctx->packets_keyflag[ctx->buf_index]=false;
-	}
+	packet->key=enc_metadata.KeyFrame;
 
-	ctx->buf_index=(ctx->buf_index+1)%ctx->packets_num;	
-	ctx->packet_ready->notify_all();
-	guard.unlock();
+	{
+		std::lock_guard<std::mutex> guard(*ctx->lock);
+		ctx->packets->push(std::move(packet));
+		ctx->packet_ready->notify_all();
+	}
 
 	if (ctx->enc->capture_plane.qBuffer(*v4l2_buf, NULL) < 0)
 	{
@@ -144,17 +131,18 @@ nvmpictx* nvmpi_create_encoder(nvCodingType codingType,nvEncParam * param){
 	ctx->height=param->height;
 	ctx->enableLossless=false;
 	ctx->bitrate=param->bitrate;
+	ctx->peak_bitrate=param->peak_bitrate;
 	ctx->ratecontrol = V4L2_MPEG_VIDEO_BITRATE_MODE_CBR;	
 	ctx->idr_interval = param->idr_interval;
 	ctx->fps_n = param->fps_n;
 	ctx->fps_d = param->fps_d;
 	ctx->iframe_interval = param->iframe_interval;
-	ctx->packet_pools=new std::queue<int>;
+	ctx->packets=new std::queue<std::unique_ptr<nvEncodedPacket>>;
+	ctx->taken=new std::unique_ptr<nvEncodedPacket>;
 	ctx->lock=new std::mutex;
 	ctx->packet_ready=new std::condition_variable;
 	ctx->eos_sent=false;
 	ctx->eos_received=false;
-	ctx->buf_index=0;
 	ctx->enable_extended_colorformat=false;
 	ctx->packets_num=param->capture_num;
 	ctx->qmax=param->qmax;
@@ -257,11 +245,6 @@ nvmpictx* nvmpi_create_encoder(nvCodingType codingType,nvEncParam * param){
 
 	if(param->mode_vbr)
 		ctx->ratecontrol=V4L2_MPEG_VIDEO_BITRATE_MODE_VBR;
-
-	ctx->packets_buf_size=CHUNK_SIZE;
-
-	for(int index=0;index<MAX_BUFFERS;index++)
-		ctx->packets[index]=new unsigned char[ctx->packets_buf_size];
 
 	if(codingType==NV_VIDEO_CodingH264){
 		ctx->encoder_pixfmt=V4L2_PIX_FMT_H264;
@@ -488,39 +471,31 @@ int nvmpi_encoder_put_frame(nvmpictx* ctx,nvFrame* frame){
 
 // Take the next encoded packet. Before end of stream it doesn't wait: -1 means
 // none is ready yet. After put_frame(NULL) it waits for each packet, and -1
-// means the encoder is drained.
+// means the encoder is drained. The payload stays valid until the next call.
 int nvmpi_encoder_get_packet(nvmpictx* ctx,nvPacket* packet){
 
-	int packet_index;
 	std::unique_lock<std::mutex> guard(*ctx->lock);
 
 	if(ctx->eos_sent){
 		bool ready=ctx->packet_ready->wait_for(guard,std::chrono::milliseconds(DRAIN_TIMEOUT_MS),
-				[ctx]{return !ctx->packet_pools->empty() || ctx->eos_received;});
+				[ctx]{return !ctx->packets->empty() || ctx->eos_received;});
 		if(!ready)
 			cout << "Timed out draining the encoder" << std::endl;
 	}
 
-	if(ctx->packet_pools->empty())
+	if(ctx->packets->empty())
 		return -1;
 
-	packet_index= ctx->packet_pools->front();
+	*ctx->taken=std::move(ctx->packets->front());
+	ctx->packets->pop();
+	guard.unlock();
 
-	auto ts = ctx->timestamp[packet_index];
-	auto size = ctx->packets_size[packet_index];
-	if((ts > 0) && (size == 0)) // Old packet, but 0-0 skip!
-	{
-		return -1;
-	}
-
-	packet->payload=ctx->packets[packet_index];
-	packet->pts=ts;
-
-	packet->payload_size=size;
-	if(ctx->packets_keyflag[packet_index])
+	nvEncodedPacket *taken=ctx->taken->get();
+	packet->payload=taken->data.data();
+	packet->payload_size=taken->data.size();
+	packet->pts=taken->pts;
+	if(taken->key)
 		packet->flags|= 0x0001;//AV_PKT_FLAG_KEY 0x0001
-	ctx->packets_size[packet_index] = 0; // mark as readed
-	ctx->packet_pools->pop();
 	return 0;
 }
 
@@ -529,7 +504,8 @@ int nvmpi_encoder_close(nvmpictx* ctx){
 	ctx->enc->capture_plane.stopDQThread();
 	ctx->enc->capture_plane.waitForDQThread(1000);
 	delete ctx->enc;
-	delete ctx->packet_pools;
+	delete ctx->packets;
+	delete ctx->taken;
 	delete ctx->packet_ready;
 	delete ctx->lock;
 	delete ctx;
